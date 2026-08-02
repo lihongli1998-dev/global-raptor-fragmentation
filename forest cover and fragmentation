@@ -1,0 +1,74 @@
+## Google Earth Engine (GEE) scripts
+
+GEE scripts used to quantify forest cover and fragmentation metrics within species’ distribution ranges are publicly available in the `GEE/` folder.
+﻿ Calculate species range area and forest area (km²) within each raptor's AOH distribution based on the GLCLU forest height dataset (2000). 
+
+var forest_height_2000 = ee.Image('projects/glad/GLCLU2020/Forest_height_2000');
+
+var raw_forest = forest_height_2000.gte(5).rename('forest_mask');
+// 3×3 majority filter）
+var kernel = ee.Kernel.square({radius: 1});
+var smoothed_forest = raw_forest.reduceNeighborhood({
+  reducer: ee.Reducer.mode(),
+  kernel: kernel
+}).selfMask().rename('forest_mask');
+
+var forest_extent_2000 = smoothed_forest;
+                  
+var folderPath = 'projects/**';
+var assetList = ee.data.listAssets(folderPath).assets.map(function(a) {
+  return a.id;
+});
+
+
+var calculateForestAreaFromAsset = function(assetId) {
+  var species_img = ee.Image(assetId).eq(1).selfMask(); 
+  var bandName = assetId.split('/').slice(-1)[0];  
+  
+  var species_geometry = species_img.geometry();
+  var species_area = ee.Image.pixelArea()
+    .updateMask(species_img)
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: species_geometry,
+      scale: 30,
+      maxPixels: 1e13
+    });
+    
+  var species_area_sqkm = ee.Algorithms.If(
+    species_area.contains('area'),
+    ee.Number(species_area.get('area')).divide(1e6),
+    0
+  );
+  
+  var forest_in_band = forest_extent_2000.updateMask(species_img);
+  var forest_area = ee.Image.pixelArea()
+    .updateMask(forest_in_band)
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: species_geometry,
+      scale: 30,
+      maxPixels: 1e13
+    });
+    
+  var forest_area_sqkm = ee.Algorithms.If(
+    forest_area.contains('area'),
+    ee.Number(forest_area.get('area')).divide(1e6),
+    0
+  );
+  
+  return ee.Feature(null, {
+    'Species': bandName,
+    'Species_Area_sqkm': species_area_sqkm, 
+    'Forest_Area_sqkm': forest_area_sqkm   
+  });
+};
+
+var areaResults = ee.FeatureCollection(assetList.map(calculateForestAreaFromAsset));
+
+Export.table.toDrive({
+  collection: areaResults,
+  description: 'Raptor_Area_Export',
+  fileFormat: 'CSV',
+  selectors: ['Species', 'Species_Area_sqkm', 'Forest_Area_sqkm'] 
+});
