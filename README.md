@@ -1,6 +1,6 @@
 # Global forest fragmentation and extinction risk for forest-dependent raptors
 
-This repository contains the data and R code for the manuscript:
+This repository contains the data and R and GEE code for the manuscript:
 
 **Li, H., Wittig, C., Buij, R., Buechley, E.R., Xie, Z., Torres-Romero, E.J., Surasinghe, T.D., Foysal, M., Shandilya, A.S., Martens, P., & O'Bryan, C.J. (2025).** *Global forest fragmentation signals declining habitat quality and increased extinction risk for forest-dependent raptors.*
 
