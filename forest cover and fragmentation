@@ -72,3 +72,191 @@ Export.table.toDrive({
   fileFormat: 'CSV',
   selectors: ['Species', 'Species_Area_sqkm', 'Forest_Area_sqkm'] 
 });
+
+
+
+
+#### fragmentation  calculate
+
+var forest_height_2020 = ee.Image('projects/glad/GLCLU2020/Forest_height_2020');
+
+var raw_forest = forest_height_2020.gte(5).rename('forest_mask');
+var kernel = ee.Kernel.square({radius: 1});
+var smoothed_forest = raw_forest.reduceNeighborhood({
+  reducer: ee.Reducer.mode(),
+  kernel: kernel
+}).selfMask().rename('forest_mask');
+
+var forest_extent_2020 = smoothed_forest;
+
+var folderPath = 'projects/**';
+var assetList = ee.data.listAssets(folderPath).assets.map(function(a) {
+  return { id: a.id, species_id: a.id.split('/').pop() };
+});
+
+
+var splitGeometry = function(geometry, rows, cols) { 
+  var bounds = geometry.bounds();
+  var coords = ee.List(bounds.coordinates().get(0));
+  var xmin = ee.Number(ee.List(coords.get(0)).get(0));
+  var ymin = ee.Number(ee.List(coords.get(0)).get(1));
+  var xmax = ee.Number(ee.List(coords.get(2)).get(0));
+  var ymax = ee.Number(ee.List(coords.get(2)).get(1));
+  var xStep = xmax.subtract(xmin).divide(cols);
+  var yStep = ymax.subtract(ymin).divide(rows);
+  var grids = ee.List.sequence(0, rows - 1).map(function(row) {
+    return ee.List.sequence(0, cols - 1).map(function(col) {
+      var x0 = xmin.add(xStep.multiply(col));
+      var y0 = ymin.add(yStep.multiply(row));
+      var x1 = x0.add(xStep);
+      var y1 = y0.add(yStep);
+      return ee.Feature(ee.Geometry.Rectangle([x0, y0, x1, y1]));
+    });
+  }).flatten();
+  return ee.FeatureCollection(grids);
+};
+
+
+var calculatePatchStats = function(assetId, speciesId) {
+  assetId = ee.String(assetId);
+  var speciesRaster = ee.Image(assetId).eq(1).selfMask();
+  var geom = speciesRaster.geometry();
+
+  var speciesForest = forest_extent_2020.updateMask(speciesRaster);
+
+  var cc = speciesForest.connectedComponents({
+    connectedness: ee.Kernel.square(1),
+    maxSize: 1024
+  });
+  var labelImg = cc.select('labels').rename('patch_id');
+
+  var rows = 1, cols = 1; 
+  var tiles = splitGeometry(geom, rows, cols);
+
+  var perTileVectors = ee.FeatureCollection(
+    tiles.map(function(t) {
+      var tileGeom = ee.Feature(t).geometry();
+      return labelImg.reduceToVectors({
+        geometry: tileGeom,
+        scale: 30,
+        geometryType: 'polygon',
+        eightConnected: true,
+        labelProperty: 'patch_id',
+        maxPixels: 1e12
+      });
+    })
+  ).flatten();
+
+  var mergedVectors = perTileVectors;
+
+  var projMeters = ee.Projection('EPSG:3857');
+  var vectors = mergedVectors.map(function(f) {
+    var g = f.geometry();
+    var area_km2 = g.area(1, projMeters).divide(1e6);
+    var perim_m  = g.perimeter(1, projMeters);
+    return f.set({
+      'area_km2': area_km2,
+      'perim_m': perim_m
+    });
+  });
+
+  var minArea = 0.0009; // km²
+
+  var areaListAll = ee.List(vectors.aggregate_array('area_km2'));
+  var areaList = areaListAll.filter(ee.Filter.gte('item', minArea));
+
+var computeENN = function(patchVectors) {
+  var centroids = patchVectors.map(function(f) {
+    return ee.Feature(f.centroid(30)).set('patch_id', f.get('patch_id'));
+  }).randomColumn('uid');
+
+  var distFilter = ee.Filter.and(
+    ee.Filter.withinDistance({
+      distance: 1e4,   
+      leftField: '.geo',
+      rightField: '.geo'
+    }),
+    ee.Filter.notEquals({leftField: 'uid', rightField: 'uid'})
+  );
+
+  var saveBest = ee.Join.saveBest({
+    matchKey: 'nn',
+    measureKey: 'dist'
+  });
+
+  var nnJoined = ee.FeatureCollection(saveBest.apply(centroids, centroids, distFilter));
+
+  var withDist = nnJoined.map(function(f) {
+    var nn = ee.Feature(f.get('nn'));
+    var d = f.geometry().distance(nn.geometry(), 1); 
+    return f.set('ENN', d);
+  });
+
+  var meanENN = ee.Algorithms.If(
+    centroids.size().gt(1),
+    ee.Number(withDist.aggregate_mean('ENN')),
+    null
+  );
+  return meanENN;
+};
+
+var bigVectors = vectors.filter(ee.Filter.gte('area_km2', minArea));
+var meanENN = computeENN(bigVectors);
+
+  // 6) Shannon
+  var totalArea = ee.Number(areaList.reduce(ee.Reducer.sum())); 
+  var shannon = ee.Number(
+    areaList.map(function(a) {
+      var p = ee.Number(a).divide(totalArea);
+      return p.multiply(p.log()).multiply(-1);
+    }).reduce(ee.Reducer.sum())
+  );
+
+  // 7) ED
+  var bigVectors = vectors.filter(ee.Filter.gte('area_km2', minArea));
+  var totalEdgeLength = ee.Number(bigVectors.aggregate_sum('perim_m'));
+  var ED = totalEdgeLength.divide(totalArea.multiply(100)); // m/ha
+
+  return ee.Feature(null, {
+    'species_id'     : speciesId,
+    'patch_count'    : areaList.size(),
+    'min_area_km2'   : ee.Number(areaList.reduce(ee.Reducer.min())),
+    'max_area_km2'   : ee.Number(areaList.reduce(ee.Reducer.max())),
+    'mean_area_km2'  : ee.Number(areaList.reduce(ee.Reducer.mean())),
+    'median_area_km2': ee.Number(areaList.reduce(ee.Reducer.median())),
+    'mean_ENN_m'     : meanENN,
+    'shannon_index'  : shannon,
+    'ED_m_per_ha'    : ED
+  });
+};
+
+var batchSize = 10;   
+var totalAssets = assetList.length;
+var numBatches = Math.ceil(totalAssets / batchSize);
+
+for (var b = 0; b < numBatches; b++) {
+  var start = b * batchSize;
+  var end = Math.min(start + batchSize, totalAssets);
+  var batchAssets = assetList.slice(start, end);
+
+  var patchStatsCollection = ee.FeatureCollection(
+    batchAssets.map(function(a) {
+      return calculatePatchStats(a.id, a.species_id);
+    })
+  );
+
+  Export.table.toDrive({
+    collection: patchStatsCollection,
+    description: 'Forest_Fragmentation_Stats_batch_' + (b+1),
+    fileFormat: 'CSV',
+    selectors: [
+      'species_id', 'patch_count', 
+      'min_area_km2', 'max_area_km2',
+      'mean_area_km2', 'median_area_km2',
+      'mean_ENN_m', 'shannon_index', 'ED_m_per_ha'
+    ]
+  });
+}
+
+
+
